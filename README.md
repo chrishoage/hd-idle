@@ -19,6 +19,7 @@ _Important note_: `hd-idle` is not compatible with the usage of disk monitoring 
 * [Install](#Install)
   * [Precompiled binaries](#precompiled-binaries)
   * [Build from source](#build-from-source)
+  * [NixOS flake](#nixos-flake)
 * [Run hd-idle](#run-hd-idle)
 * [Configuration](#Configuration)
 * [Understand the logs](#understand-the-logs)
@@ -101,6 +102,43 @@ by substituting the parameter `-a`.
 Then install the package:
 
     # dpkg -i ../hd-idle*.deb
+
+### NixOS flake
+
+The flake provides `packages.<system>.default` and `nixosModules.default` for
+Linux systems. Add this repository as an input to your NixOS flake and import
+its module:
+
+```nix
+{
+  inputs.hd-idle.url = "github:chrishoage/hd-idle/feat/wake-window";
+
+  outputs = { nixpkgs, hd-idle, ... }:
+  let
+    hdIdleConfig = {
+      services.hd-idle.enable = true;
+      services.hd-idle.idleTime = 1800;
+      services.hd-idle.wakeWindow = "00:00-09:00";
+      services.hd-idle.wakeIdleTime = 10800;
+      services.hd-idle.logFile = "/var/log/hd-idle.log";
+      services.hd-idle.disks."/dev/disk/by-id/ata-example".idleTime = 3600;
+    };
+  in {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [ hd-idle.nixosModules.default hdIdleConfig ];
+    };
+  };
+}
+```
+
+This runs the flake's `hd-idle` package with a 30-minute timeout outside the
+window and a three-hour timeout inside it. Times in `wakeWindow` use the
+machine's local time. Set `wakeIdleTime = null` (the default) to suppress
+spindown inside the window. Set `disks` to an attribute set of device names
+and idle times for per-device settings. Use `extraArgs` for flags without typed
+options. The module creates `hd-idle.service`,
+so remove any existing custom unit with that name when enabling it.
     
 ## Run hd-idle
 
@@ -141,6 +179,22 @@ Command line options:
                         Idle time in seconds for the currently named disk(s)
                         (-a *name*) or for all disks.
                         Setting this value to `0` will never spin down the disk(s).
+
++ -w *HH:MM-HH:MM*
+  Daily wake window in local time for all disks, for example
+  `-w 00:00-09:00`. The start is included and the end is
+  excluded; windows may cross midnight. Without `-W`, spindown
+  is suppressed during the window, including with `-I`.
+
++ -W *seconds*
+  Idle time in seconds during the wake window for disks enabled by `-i`.
+  Requires `-w`. A disk with `-i 0` remains disabled.
+  For example, `-w 00:00-09:00 -W 10800` uses a three-hour timeout
+  inside the window and each disk's `-i` timeout outside it. `-W 0`
+  suppresses spindown inside the window. Time since the disk's last
+  actual activity determines eligibility on both sides of the window;
+  an already idle disk may spin down on the first poll after the window ends.
+  The window never wakes an already sleeping disk.
                          
 + -c *command_type*       
                         Api call to stop the device. Possible values are `scsi`

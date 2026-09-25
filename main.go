@@ -21,6 +21,7 @@ import (
 	"github.com/adelolmo/hd-idle/io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -130,6 +131,32 @@ func main() {
 		case "-I":
 			config.Defaults.IgnoreSpinDownDetection = true
 
+		case "-w":
+			s, err := argument(index)
+			if err != nil {
+				fmt.Println("Missing wake window after -w. Must be HH:MM-HH:MM.")
+				os.Exit(1)
+			}
+			window, err := parseWakeWindow(s)
+			if err != nil {
+				fmt.Printf("Invalid wake window -w %s. Must be HH:MM-HH:MM with different start and end times.\n", s)
+				os.Exit(1)
+			}
+			config.WakeWindow = window
+
+		case "-W":
+			s, err := argument(index)
+			if err != nil {
+				fmt.Println("Missing wake idle time after -W. Must be a non-negative number of seconds.")
+				os.Exit(1)
+			}
+			idle, err := parseWakeIdle(s)
+			if err != nil {
+				fmt.Printf("Invalid wake idle time -W %s. Must be a non-negative number of seconds.\n", s)
+				os.Exit(1)
+			}
+			config.WakeIdle = &idle
+
 		case "-c":
 			command, err := argument(index)
 			if err != nil {
@@ -181,6 +208,10 @@ func main() {
 			os.Exit(0)
 		}
 	}
+	if config.WakeIdle != nil && config.WakeWindow == nil {
+		fmt.Println("-W requires a wake window set with -w.")
+		os.Exit(1)
+	}
 
 	if singleDiskMode {
 		if err := spindownDisk(
@@ -200,7 +231,7 @@ func main() {
 	}
 	fmt.Println(config.String())
 
-	interval := poolInterval(config.Devices)
+	interval := poolInterval(config)
 	config.SkewTime = interval * 3
 	for {
 		ObserveDiskActivity(config)
@@ -214,7 +245,7 @@ func argument(index int) (string, error) {
 		return "", fmt.Errorf("option requires argument")
 	}
 	arg := os.Args[argIndex]
-	if arg[:1] == "-" {
+	if arg == "" || arg[:1] == "-" {
 		return "", fmt.Errorf("option requires argument")
 	}
 	return arg, nil
@@ -222,22 +253,67 @@ func argument(index int) (string, error) {
 
 func usage() {
 	fmt.Println("usage: hd-idle [-t <disk>] [-s <symlink_policy>] [-a <name>] [-i <idle_time>] " +
-		"[-c <command_type>] [-p power_condition] [-l <logfile>] [-d] [-I] [-h]")
+		"[-c <command_type>] [-p power_condition] [-l <logfile>] [-w HH:MM-HH:MM] [-W <seconds>] [-d] [-I] [-h]")
 }
 
-func poolInterval(deviceConfs []DeviceConf) time.Duration {
-	if len(deviceConfs) == 0 {
-		return defaultIdleTime / 10
+func parseWakeIdle(value string) (time.Duration, error) {
+	seconds, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || seconds > uint64((1<<63-1)/int64(time.Second)) {
+		return 0, fmt.Errorf("invalid wake idle time")
 	}
+	return time.Duration(seconds) * time.Second, nil
+}
 
+func parseWakeWindow(value string) (*WakeWindow, error) {
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid wake window")
+	}
+	start, err := parseClockMinute(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	end, err := parseClockMinute(parts[1])
+	if err != nil || start == end {
+		return nil, fmt.Errorf("invalid wake window")
+	}
+	return &WakeWindow{StartMinute: start, EndMinute: end}, nil
+}
+
+func parseClockMinute(value string) (int, error) {
+	if len(value) != 5 || value[2] != ':' {
+		return 0, fmt.Errorf("invalid clock time")
+	}
+	for _, index := range []int{0, 1, 3, 4} {
+		if value[index] < '0' || value[index] > '9' {
+			return 0, fmt.Errorf("invalid clock time")
+		}
+	}
+	hour, _ := strconv.Atoi(value[:2])
+	minute, _ := strconv.Atoi(value[3:])
+	if hour > 23 || minute > 59 {
+		return 0, fmt.Errorf("invalid clock time")
+	}
+	return hour*60 + minute, nil
+}
+
+func poolInterval(config *Config) time.Duration {
 	interval := defaultIdleTime
-	for _, dev := range deviceConfs {
+	enabled := config.Defaults.Idle > 0
+	if enabled && config.Defaults.Idle < interval {
+		interval = config.Defaults.Idle
+	}
+	for _, dev := range config.Devices {
 		if dev.Idle == 0 {
 			continue
 		}
+		enabled = true
 		if dev.Idle < interval {
 			interval = dev.Idle
 		}
+	}
+	if enabled && config.WakeIdle != nil && *config.WakeIdle > 0 && *config.WakeIdle < interval {
+		interval = *config.WakeIdle
 	}
 
 	sleepTime := interval / 10

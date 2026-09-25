@@ -12,6 +12,15 @@ START_HD_IDLE=false
 #                          parameter. This can also be a symlink
 #                          (e.g. /dev/disk/by-uuid/...)
 #  -i <idle_time>          Idle time in seconds.
+#  -w HH:MM-HH:MM          Daily wake window in local time for all disks, e.g.
+#                          00:00-09:00. Without -W, suppresses spindown,
+#                          including with -I.
+#  -W <seconds>            Idle time inside the wake window for disks enabled
+#                          by -i. Requires -w. A disk with -i 0 stays disabled.
+#                          For example, -W 10800 means 3 hours;
+#                          -W 0 suppresses spindown inside the window. Outside
+#                          the window, -i applies. Idle time always counts
+#                          from the disk's last actual activity.
 #  -c <command_type>       Api call to stop the device. Possible values are "scsi"
 #                          (default value) and "ata".
 #  -p <power_condition>

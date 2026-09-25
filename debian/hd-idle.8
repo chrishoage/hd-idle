@@ -47,6 +47,22 @@ Idle time in seconds for the currently named disk(s) (-a <name>) or for
 all disks.
 Setting this value to "0" will never spin down the disk(s).
 .TP
+.B \-w HH:MM-HH:MM
+Daily wake window in local time for all disks, for example
+.B \-w 00:00-09:00.
+The start is included and the end is excluded; the window may cross midnight.
+Without \-W, spindown is suppressed during the window, including with \-I.
+.TP
+.B \-W seconds
+Idle time in seconds during the wake window for disks enabled by \-i.
+Requires \-w. A disk with \-i 0 remains disabled.
+For example, \-w 00:00-09:00 \-W 10800 uses a three-hour timeout inside
+the window and each disk's \-i timeout outside it. A value of 0 suppresses
+spindown inside the window. The time since the disk's last actual activity
+determines eligibility on both sides of the window; an already idle disk may
+spin down on the first poll after the window ends. The window does not wake
+an already sleeping disk.
+.TP
 .B \-c command_type
 Api call to stop the device. Possible values are "scsi" (default value)
 and "ata".

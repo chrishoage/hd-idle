@@ -52,10 +52,65 @@ type DeviceConf struct {
 }
 
 type Config struct {
-	Devices  []DeviceConf
-	Defaults DefaultConf
-	SkewTime time.Duration
-	NameMap  map[string]string
+	Devices    []DeviceConf
+	Defaults   DefaultConf
+	SkewTime   time.Duration
+	NameMap    map[string]string
+	WakeWindow *WakeWindow
+	WakeIdle   *time.Duration
+}
+
+type WakeWindow struct {
+	StartMinute int
+	EndMinute   int
+}
+
+func (w *WakeWindow) contains(at time.Time) bool {
+	day := time.Date(at.Year(), at.Month(), at.Day(), 12, 0, 0, 0, at.Location())
+	if w.StartMinute < w.EndMinute {
+		return w.containsDay(at, day)
+	}
+	return w.containsDay(at, day.AddDate(0, 0, -1)) || w.containsDay(at, day)
+}
+
+func (w *WakeWindow) containsDay(at, day time.Time) bool {
+	start := wakeWindowBoundary(day, w.StartMinute, false)
+	endDay := day
+	if w.StartMinute > w.EndMinute {
+		endDay = day.AddDate(0, 0, 1)
+	}
+	end := wakeWindowBoundary(endDay, w.EndMinute, true)
+	return !at.Before(start) && at.Before(end)
+}
+
+func wakeWindowBoundary(day time.Time, minute int, last bool) time.Time {
+	location := day.Location()
+	year, month, date := day.Date()
+	target := time.Date(year, month, date, minute/60, minute%60, 0, 0, time.UTC)
+	dayStart := time.Date(year, month, date, 0, 0, 0, 0, location)
+	nextDay := day.AddDate(0, 0, 1)
+	nextStart := time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(), 0, 0, 0, 0, location)
+	var boundary time.Time
+	for probe := dayStart.Add(-3 * time.Hour); probe.Before(nextStart.Add(3 * time.Hour)); probe = probe.Add(time.Hour) {
+		_, offset := probe.In(location).Zone()
+		candidate := target.Add(-time.Duration(offset) * time.Second).In(location)
+		if candidate.Year() == year && candidate.Month() == month && candidate.Day() == date && candidate.Hour()*60+candidate.Minute() == minute {
+			if boundary.IsZero() || (last && candidate.After(boundary)) || (!last && candidate.Before(boundary)) {
+				boundary = candidate
+			}
+		}
+	}
+	if !boundary.IsZero() {
+		return boundary
+	}
+	// A skipped wall-clock time ends at the first actual minute after the gap.
+	for probe := dayStart; probe.Before(nextStart); probe = probe.Add(time.Minute) {
+		local := probe.In(location)
+		if local.Year() == year && local.Month() == month && local.Day() == date && local.Hour()*60+local.Minute() >= minute {
+			return probe
+		}
+	}
+	return nextStart
 }
 
 func (c *Config) resolveDeviceGivenName(name string) string {
@@ -83,6 +138,7 @@ type DiskStats struct {
 var previousSnapshots []DiskStats
 var now = time.Now()
 var lastNow = time.Now()
+var issueSpindown = spindownDisk
 
 func ObserveDiskActivity(config *Config) {
 	actualSnapshot := diskstats.Snapshot()
@@ -127,8 +183,8 @@ func updateState(tmp DiskStats, config *Config) {
 		return
 	}
 
-	intervalDurationInSeconds := now.Unix() - lastNow.Unix()
-	if intervalDurationInSeconds > config.SkewTime.Milliseconds()/1000 {
+	// Strip monotonic readings so time spent suspended counts toward the gap.
+	if now.Round(0).Sub(lastNow.Round(0)) > config.SkewTime {
 		/* we slept too long, assume a suspend event and disks may be spun up */
 		/* reset spin status and timers */
 		previousSnapshots[dsi].SpinUpAt = now
@@ -136,7 +192,6 @@ func updateState(tmp DiskStats, config *Config) {
 		previousSnapshots[dsi].SpunDown = false
 		logSpinupAfterSleep(previousSnapshots[dsi].Name, config.Defaults.LogFile)
 	}
-
 	ds := previousSnapshots[dsi]
 	if ds.Writes == tmp.Writes && ds.Reads == tmp.Reads {
 		if !ds.SpunDown || config.Defaults.IgnoreSpinDownDetection {
@@ -144,7 +199,15 @@ func updateState(tmp DiskStats, config *Config) {
 			idleDuration := now.Sub(ds.LastIoAt)
 			timeSinceLastSpunDown := now.Sub(ds.LastSpunDownAt)
 
-			if ds.IdleTime != 0 && idleDuration > ds.IdleTime && timeSinceLastSpunDown > ds.IdleTime {
+			idleTime := ds.IdleTime
+			if config.WakeWindow != nil && config.WakeWindow.contains(now) {
+				idleTime = 0
+				if config.WakeIdle != nil {
+					idleTime = *config.WakeIdle
+				}
+			}
+
+			if ds.IdleTime != 0 && idleTime != 0 && idleDuration > idleTime && timeSinceLastSpunDown > idleTime {
 				if ds.SpunDown && config.Defaults.IgnoreSpinDownDetection {
 					fmt.Printf("%s spindown (ignoring prior spin down state)\n",
 						config.resolveDeviceGivenName(ds.Name))
@@ -153,7 +216,7 @@ func updateState(tmp DiskStats, config *Config) {
 						config.resolveDeviceGivenName(ds.Name))
 				}
 				device := fmt.Sprintf("/dev/%s", ds.Name)
-				if err := spindownDisk(device, ds.CommandType, ds.PowerCondition, config.Defaults.Debug); err != nil {
+				if err := issueSpindown(device, ds.CommandType, ds.PowerCondition, config.Defaults.Debug); err != nil {
 					fmt.Println(err.Error())
 				}
 				previousSnapshots[dsi].LastSpunDownAt = now
@@ -289,8 +352,16 @@ func (c *Config) String() string {
 	for _, device := range c.Devices {
 		devices += "{" + device.String() + "}"
 	}
-	return fmt.Sprintf("symlinkPolicy=%d, defaultIdle=%v, defaultCommand=%s, defaultPowerCondition=%v, debug=%t, logFile=%s, devices=%s, ignoreSpinDownDetection=%t",
-		c.Defaults.SymlinkPolicy, c.Defaults.Idle.Seconds(), c.Defaults.CommandType, c.Defaults.PowerCondition, c.Defaults.Debug, c.Defaults.LogFile, devices, c.Defaults.IgnoreSpinDownDetection)
+	window := "none"
+	if c.WakeWindow != nil {
+		window = fmt.Sprintf("%02d:%02d-%02d:%02d", c.WakeWindow.StartMinute/60, c.WakeWindow.StartMinute%60, c.WakeWindow.EndMinute/60, c.WakeWindow.EndMinute%60)
+	}
+	wakeIdle := "none"
+	if c.WakeIdle != nil {
+		wakeIdle = fmt.Sprintf("%v", c.WakeIdle.Seconds())
+	}
+	return fmt.Sprintf("symlinkPolicy=%d, defaultIdle=%v, defaultCommand=%s, defaultPowerCondition=%v, debug=%t, logFile=%s, devices=%s, ignoreSpinDownDetection=%t, wakeWindow=%s, wakeIdle=%s",
+		c.Defaults.SymlinkPolicy, c.Defaults.Idle.Seconds(), c.Defaults.CommandType, c.Defaults.PowerCondition, c.Defaults.Debug, c.Defaults.LogFile, devices, c.Defaults.IgnoreSpinDownDetection, window, wakeIdle)
 }
 
 func (dc *DeviceConf) String() string {
